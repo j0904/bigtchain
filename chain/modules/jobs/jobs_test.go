@@ -36,11 +36,11 @@ func makeJobReq(id, modelID string) types.JobRequest {
 
 func TestJobLifecycle_CommitRevealCommitment(t *testing.T) {
 	m := jobs.New(newTestStore(t))
-	workers := []string{"w1", "w2", "w3"}
+	server := "server1"
 
 	// Phase 1: Commit
 	req := makeJobReq("job-001", "llama3")
-	if err := m.Commit(req, 1, workers); err != nil {
+	if err := m.Commit(req, 1, server); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -50,40 +50,24 @@ func TestJobLifecycle_CommitRevealCommitment(t *testing.T) {
 		t.Fatalf("reveal: %v", err)
 	}
 
-	// Worker 1 commits
-	hash := jobs.ComputeOutputHash([]byte("the answer is 42"), "job-001", "bls-pub-w1")
-	agreed, err := m.AddCommitment(types.OutputCommitment{
-		JobID: "job-001", ValidatorAddr: "w1", OutputHash: hash, Slot: 1,
-	})
-	if err != nil {
-		t.Fatalf("add commitment w1: %v", err)
-	}
-	if agreed {
-		t.Error("should not agree with 1 of 3")
-	}
-
-	// Worker 2 commits same hash -> majority reached.
-	hash2 := jobs.ComputeOutputHash([]byte("the answer is 42"), "job-001", "bls-pub-w1")
-	agreed, err = m.AddCommitment(types.OutputCommitment{
-		JobID: "job-001", ValidatorAddr: "w2", OutputHash: hash2, Slot: 1,
-	})
-	if err != nil {
-		t.Fatalf("add commitment w2: %v", err)
-	}
-	if !agreed {
-		t.Error("expected majority agreement with 2 matching commitments")
+	// Single server commits output.
+	hash := jobs.ComputeOutputHash([]byte("the answer is 42"), "job-001", "bls-pub-server1")
+	if err := m.AddCommitment(types.OutputCommitment{
+		JobID: "job-001", ValidatorAddr: "server1", OutputHash: hash, Slot: 1,
+	}); err != nil {
+		t.Fatalf("add commitment server: %v", err)
 	}
 
 	j, _ := m.GetJob("job-001")
-	if j.State != jobs.JobAgreed {
-		t.Errorf("expected job state Agreed, got %d", j.State)
+	if j.State != jobs.JobServed {
+		t.Errorf("expected job state Served, got %d", j.State)
 	}
 }
 
 func TestReveal_WrongNonce_Rejected(t *testing.T) {
 	m := jobs.New(newTestStore(t))
 	req := makeJobReq("job-002", "llama3")
-	m.Commit(req, 1, []string{"w1", "w2", "w3"}) //nolint:errcheck
+	m.Commit(req, 1, "server1") //nolint:errcheck
 
 	rev := types.RevealTx{JobID: "job-002", Prompt: "hello", Nonce: "wrong-nonce"}
 	if err := m.Reveal(rev); err == nil {
@@ -94,52 +78,127 @@ func TestReveal_WrongNonce_Rejected(t *testing.T) {
 func TestDuplicateCommitment_Rejected(t *testing.T) {
 	m := jobs.New(newTestStore(t))
 	req := makeJobReq("job-003", "gpt2")
-	m.Commit(req, 1, []string{"w1", "w2", "w3"}) //nolint:errcheck
+	m.Commit(req, 1, "server1") //nolint:errcheck
 	m.Reveal(types.RevealTx{JobID: "job-003", Prompt: "hello", Nonce: "abc"}) //nolint:errcheck
 
 	hash := jobs.ComputeOutputHash([]byte("output"), "job-003", "pub")
-	m.AddCommitment(types.OutputCommitment{JobID: "job-003", ValidatorAddr: "w1", OutputHash: hash, Slot: 1}) //nolint:errcheck
+	m.AddCommitment(types.OutputCommitment{JobID: "job-003", ValidatorAddr: "server1", OutputHash: hash, Slot: 1}) //nolint:errcheck
 
-	// Second commitment from same validator -> should fail.
-	_, err := m.AddCommitment(types.OutputCommitment{JobID: "job-003", ValidatorAddr: "w1", OutputHash: hash, Slot: 1})
+	// Second commitment from same server -> should fail (equivocation).
+	err := m.AddCommitment(types.OutputCommitment{JobID: "job-003", ValidatorAddr: "server1", OutputHash: hash, Slot: 1})
 	if err == nil {
-		t.Fatal("expected error for duplicate commitment from same validator")
+		t.Fatal("expected error for duplicate commitment from server")
 	}
 }
 
-func TestNonWorker_Commitment_Rejected(t *testing.T) {
+func TestNonServer_Commitment_Rejected(t *testing.T) {
 	m := jobs.New(newTestStore(t))
 	req := makeJobReq("job-004", "llama3")
-	m.Commit(req, 1, []string{"w1", "w2", "w3"})                                                     //nolint:errcheck
-	m.Reveal(types.RevealTx{JobID: "job-004", Prompt: "hello", Nonce: "abc"})                        //nolint:errcheck
+	m.Commit(req, 1, "server1")                                                          //nolint:errcheck
+	m.Reveal(types.RevealTx{JobID: "job-004", Prompt: "hello", Nonce: "abc"})            //nolint:errcheck
 
 	hash := jobs.ComputeOutputHash([]byte("output"), "job-004", "pub")
-	_, err := m.AddCommitment(types.OutputCommitment{JobID: "job-004", ValidatorAddr: "w99", OutputHash: hash, Slot: 1})
+	err := m.AddCommitment(types.OutputCommitment{JobID: "job-004", ValidatorAddr: "not-server", OutputHash: hash, Slot: 1})
 	if err == nil {
-		t.Fatal("expected error: w99 is not an elected worker")
+		t.Fatal("expected error: not-server is not the elected server")
 	}
 }
 
-func TestFinaliseSlot_MarksMissedWorkers(t *testing.T) {
+func TestFinaliseSlot_MarksMissedServer(t *testing.T) {
 	m := jobs.New(newTestStore(t))
 	req := makeJobReq("job-005", "llama3")
-	workers := []string{"w1", "w2", "w3"}
-	m.Commit(req, 5, workers)                                                              //nolint:errcheck
+	m.Commit(req, 5, "server1")                                                           //nolint:errcheck
 	m.Reveal(types.RevealTx{JobID: "job-005", Prompt: "hello", Nonce: "abc"})             //nolint:errcheck
 
-	// Only w1 commits.
-	hash := jobs.ComputeOutputHash([]byte("output"), "job-005", "pub")
-	m.AddCommitment(types.OutputCommitment{JobID: "job-005", ValidatorAddr: "w1", OutputHash: hash, Slot: 5}) //nolint:errcheck
-
+	// Server does not commit — should be marked as missed.
 	_, missed, err := m.FinaliseSlot(5)
 	if err != nil {
 		t.Fatalf("finalise: %v", err)
 	}
-	if !missed["w2"] || !missed["w3"] {
-		t.Errorf("expected w2 and w3 to be missed, got %v", missed)
+	if !missed["server1"] {
+		t.Error("expected server1 to be missed")
 	}
-	if missed["w1"] {
-		t.Error("w1 committed so should not be missed")
+}
+
+func TestFinaliseSlot_ServerCommitted(t *testing.T) {
+	m := jobs.New(newTestStore(t))
+	req := makeJobReq("job-006", "llama3")
+	m.Commit(req, 6, "server1")                                                           //nolint:errcheck
+	m.Reveal(types.RevealTx{JobID: "job-006", Prompt: "hello", Nonce: "abc"})             //nolint:errcheck
+
+	hash := jobs.ComputeOutputHash([]byte("output"), "job-006", "pub")
+	m.AddCommitment(types.OutputCommitment{JobID: "job-006", ValidatorAddr: "server1", OutputHash: hash, Slot: 6}) //nolint:errcheck
+
+	committed, missed, err := m.FinaliseSlot(6)
+	if err != nil {
+		t.Fatalf("finalise: %v", err)
+	}
+	if len(committed) == 0 {
+		t.Error("expected server1 in committed list")
+	}
+	if missed["server1"] {
+		t.Error("server1 committed, should not be missed")
+	}
+}
+
+func TestDisputeVote_Lifecycle(t *testing.T) {
+	m := jobs.New(newTestStore(t))
+	req := makeJobReq("job-007", "llama3")
+	m.Commit(req, 7, "server1")                                                           //nolint:errcheck
+	m.Reveal(types.RevealTx{JobID: "job-007", Prompt: "hello", Nonce: "abc"})             //nolint:errcheck
+
+	hash := jobs.ComputeOutputHash([]byte("output"), "job-007", "pub")
+	m.AddCommitment(types.OutputCommitment{JobID: "job-007", ValidatorAddr: "server1", OutputHash: hash, Slot: 7}) //nolint:errcheck
+
+	// Open dispute.
+	if err := m.OpenDispute("job-007", "server1", "observer1", "observer", 7, false); err != nil {
+		t.Fatalf("open dispute: %v", err)
+	}
+
+	j, _ := m.GetJob("job-007")
+	if j.State != jobs.JobDisputed {
+		t.Errorf("expected job state Disputed, got %d", j.State)
+	}
+
+	// Cast votes.
+	if err := m.CastVote("job-007", "val1", "uphold", 1000); err != nil {
+		t.Fatalf("cast vote: %v", err)
+	}
+	if err := m.CastVote("job-007", "val2", "dismiss", 500); err != nil {
+		t.Fatalf("cast vote: %v", err)
+	}
+
+	// Duplicate vote should fail.
+	if err := m.CastVote("job-007", "val1", "uphold", 1000); err == nil {
+		t.Fatal("expected error for duplicate vote")
+	}
+
+	d, _ := m.GetDispute("job-007")
+	if d.VotesUphold != 1000 {
+		t.Errorf("expected 1000 uphold votes, got %d", d.VotesUphold)
+	}
+	if d.VotesDismiss != 500 {
+		t.Errorf("expected 500 dismiss votes, got %d", d.VotesDismiss)
+	}
+}
+
+func TestRevertJob(t *testing.T) {
+	m := jobs.New(newTestStore(t))
+	req := makeJobReq("job-008", "llama3")
+	m.Commit(req, 8, "server1")                                                           //nolint:errcheck
+	m.Reveal(types.RevealTx{JobID: "job-008", Prompt: "hello", Nonce: "abc"})             //nolint:errcheck
+	hash := jobs.ComputeOutputHash([]byte("output"), "job-008", "pub")
+	m.AddCommitment(types.OutputCommitment{JobID: "job-008", ValidatorAddr: "server1", OutputHash: hash, Slot: 8}) //nolint:errcheck
+
+	reverted, err := m.RevertJob("job-008")
+	if err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if reverted.State != jobs.JobReverted {
+		t.Errorf("expected JobReverted state, got %d", reverted.State)
+	}
+	if reverted.Commitment != nil {
+		t.Error("commitment should be nil after revert")
 	}
 }
 

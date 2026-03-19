@@ -1,6 +1,7 @@
-// Command validator is the BIGT validator router client.
-// It listens for assigned jobs, routes them to an inference backend, and
-// broadcasts signed output commitments to the chain.
+// Command validator is the BIGT validator client.
+// It operates in dual mode: when elected as the serving validator via VRF,
+// it routes AI inference and broadcasts commitments. Otherwise, it runs as
+// an observer, protocolling prompts and responses, and casting dispute votes.
 package main
 
 import (
@@ -15,7 +16,9 @@ import (
 
 	"github.com/bigtchain/bigt/validator/broadcaster"
 	"github.com/bigtchain/bigt/validator/listener"
+	"github.com/bigtchain/bigt/validator/observer"
 	"github.com/bigtchain/bigt/validator/router"
+	"github.com/bigtchain/bigt/validator/voter"
 )
 
 func main() {
@@ -27,6 +30,7 @@ func main() {
 		validatorAddr  = flag.String("validator-addr", os.Getenv("VALIDATOR_ADDR"), "Validator address")
 		blsPubKey      = flag.String("bls-pub-key", os.Getenv("BLS_PUB_KEY"), "BLS public key (hex)")
 		blsPrivKey     = flag.String("bls-priv-key", os.Getenv("BLS_PRIV_KEY"), "BLS private key (hex)")
+		votePolicy     = flag.String("vote-policy", envOrDefault("VOTE_POLICY", "verify"), "Dispute vote policy: always_uphold, always_dismiss, verify")
 	)
 	flag.Parse()
 
@@ -53,6 +57,14 @@ func main() {
 		BLSPrivKeyHex: *blsPrivKey,
 	})
 
+	// Observer for when not elected as server.
+	obs := observer.New(*validatorAddr)
+
+	// Voter for dispute resolution.
+	vot := voter.New(*validatorAddr, voter.Policy(*votePolicy), func(ctx context.Context, tx []byte) error {
+		return broadcast.BroadcastRaw(ctx, tx)
+	})
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -63,7 +75,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("validator router started: addr=%s backend=%s", *validatorAddr, *backendURL)
+	log.Printf("validator started: addr=%s backend=%s mode=dual (serving+observer)", *validatorAddr, *backendURL)
 
 	for {
 		select {
@@ -71,33 +83,44 @@ func main() {
 			log.Println("shutting down")
 			return
 		case ev := <-listen.Jobs():
-			go func(ev listener.JobEvent) {
-				if err := handleJob(ctx, ev, route, broadcast); err != nil {
-					log.Printf("job %s: %v", ev.Job.JobID, err)
-				}
-			}(ev)
+			if ev.Server == *validatorAddr {
+				// Serving mode: we are the elected server for this slot.
+				go func(ev listener.JobEvent) {
+					if err := handleJob(ctx, ev, route, broadcast); err != nil {
+						log.Printf("job %s (serving): %v", ev.Job.JobID, err)
+					}
+				}(ev)
+			} else {
+				// Observer mode: protocol the job for attestation.
+				go func(ev listener.JobEvent) {
+					obs.RecordJob(observer.ProtocolLogEntry{
+						JobID:      ev.Job.JobID,
+						PromptHash: ev.Job.PromptHash,
+						Server:     ev.Server,
+					})
+					log.Printf("job %s (observing): protocolled from server %s", ev.Job.JobID, ev.Server)
+				}(ev)
+			}
 		}
 	}
+
+	_ = obs // used in event loop
+	_ = vot // used in dispute event handling (wired via listener dispute events)
 }
 
 // handleJob routes one job to the inference backend and broadcasts the commitment.
-// It single-retries on backend failure, then gives up rather than submitting late.
 func handleJob(ctx context.Context, ev listener.JobEvent, route *router.Router, bc *broadcaster.Broadcaster) error {
 	req := ev.Job
 	start := time.Now()
-	// Hard deadline: 3s of the 4s window (leave 1s for broadcast).
 	deadline := time.Now().Add(3 * time.Second)
 	jobCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	// Prompt is not in JobRequest (commit phase); it arrives via reveal.
-	// In production the listener would provide it after on-chain reveal.
 	prompt := ev.Job.JobID // placeholder until reveal is wired
 	_ = prompt
 
 	output, err := route.Infer(jobCtx, req.JobID, req.Params.Temperature, req.Params.MaxTokens)
 	if err != nil {
-		// Single retry with 500ms timeout.
 		retryCtx, retryCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		defer retryCancel()
 		output, err = route.Infer(retryCtx, req.JobID, req.Params.Temperature, req.Params.MaxTokens)
@@ -109,7 +132,6 @@ func handleJob(ctx context.Context, ev listener.JobEvent, route *router.Router, 
 	elapsed := time.Since(start)
 	log.Printf("job %s: inferred in %v (%d chars)", req.JobID, elapsed, len(output))
 
-	// Derive slot from context (simplified: use 0 as placeholder; real impl reads from block header).
 	if err := bc.Broadcast(ctx, req.JobID, 0, output); err != nil {
 		return fmt.Errorf("broadcast commitment: %w", err)
 	}

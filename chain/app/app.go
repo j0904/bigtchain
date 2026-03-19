@@ -35,7 +35,7 @@ currentSlot  int64
 currentEpoch int64
 epochSeed    []byte
 proposer     string
-workers      []string
+server       string // VRF-elected serving validator (single-server architecture)
 slashEvents  []slashing.Event
 
 chainID     string
@@ -90,13 +90,28 @@ fmt.Fprintf(os.Stderr, "FinalizeBlock: list validators: %v\n", err)
 }
 
 a.epochSeed = vrf.EpochSeed(req.ProposerAddress, a.currentEpoch)
-a.proposer, a.workers = vrf.ElectSlot(a.epochSeed, a.currentSlot, a.activeVals)
+a.proposer, a.server = vrf.ElectSlot(a.epochSeed, a.currentSlot, a.activeVals)
 
 if _, err := a.staking.ProcessMatureUnbondings(a.currentSlot); err != nil {
 fmt.Fprintf(os.Stderr, "FinalizeBlock: process unbondings: %v\n", err)
 }
 if a.currentSlot > 0 && a.currentSlot%types.EpochSlots == 0 {
 a.endEpoch(a.currentEpoch - 1)
+}
+
+// Tally expired dispute votes before processing new transactions.
+slashEvts, err := a.slashing.TallyExpiredDisputes(a.currentSlot)
+if err != nil {
+fmt.Fprintf(os.Stderr, "FinalizeBlock: tally disputes: %v\n", err)
+}
+for _, ev := range slashEvts {
+a.slashEvents = append(a.slashEvents, ev)
+if err := a.rewards.RecordJobSlashed(ev.ValidatorAddr, a.currentEpoch); err != nil {
+fmt.Fprintf(os.Stderr, "record slashed from tally: %v\n", err)
+}
+if err := a.rewards.RecordBlockReverted(ev.ValidatorAddr, a.currentEpoch); err != nil {
+fmt.Fprintf(os.Stderr, "record reverted from tally: %v\n", err)
+}
 }
 
 txResults := make([]*abcitypes.ExecTxResult, len(req.Txs))
@@ -153,6 +168,12 @@ case types.TxCommitment:
 return a.handleCommitment(tx)
 case types.TxDispute:
 return a.handleDispute(tx)
+case types.TxObserverDispute:
+return a.handleObserverDispute(tx)
+case types.TxDisputeVote:
+return a.handleDisputeVote(tx)
+case types.TxProtocolAttestation:
+return a.handleProtocolAttestation(tx)
 case types.TxRegValidator:
 return a.handleRegisterValidator(tx)
 case types.TxDelegate:
@@ -182,7 +203,7 @@ return errResult(11, err.Error())
 if !valid {
 return errResult(12, "model not registered: "+req.ModelID)
 }
-if err := a.jobs.Commit(req, a.currentSlot, a.workers); err != nil {
+if err := a.jobs.Commit(req, a.currentSlot, a.server); err != nil {
 return errResult(13, err.Error())
 }
 return okResult("job committed: " + req.JobID)
@@ -204,20 +225,16 @@ var c types.OutputCommitment
 if err := json.Unmarshal(tx.Payload, &c); err != nil {
 return errResult(30, err.Error())
 }
-agreed, err := a.jobs.AddCommitment(c)
-if err != nil {
+if err := a.jobs.AddCommitment(c); err != nil {
 return errResult(31, err.Error())
 }
 if err := a.staking.ResetMissed(c.ValidatorAddr, a.currentEpoch); err != nil {
 fmt.Fprintf(os.Stderr, "reset missed for %s: %v\n", c.ValidatorAddr, err)
 }
-if agreed {
 if err := a.rewards.RecordJobServed(c.ValidatorAddr, a.currentEpoch); err != nil {
 fmt.Fprintf(os.Stderr, "record job served: %v\n", err)
 }
-return okResult(fmt.Sprintf("job %s agreed", c.JobID))
-}
-return okResult("commitment accepted; awaiting majority")
+return okResult(fmt.Sprintf("job %s served by %s", c.JobID, c.ValidatorAddr))
 }
 
 func (a *App) handleDispute(tx types.Tx) *abcitypes.ExecTxResult {
@@ -225,7 +242,7 @@ var d types.DisputeTx
 if err := json.Unmarshal(tx.Payload, &d); err != nil {
 return errResult(40, err.Error())
 }
-ev, err := a.slashing.ProcessUserDispute(d)
+ev, err := a.slashing.ProcessUserDispute(d, a.currentSlot)
 if err != nil {
 return errResult(41, err.Error())
 }
@@ -236,7 +253,44 @@ a.slashEvents = append(a.slashEvents, *ev)
 if err := a.rewards.RecordJobSlashed(d.ValidatorAddr, a.currentEpoch); err != nil {
 fmt.Fprintf(os.Stderr, "record slashed: %v\n", err)
 }
+if err := a.rewards.RecordBlockReverted(d.ValidatorAddr, a.currentEpoch); err != nil {
+fmt.Fprintf(os.Stderr, "record reverted: %v\n", err)
+}
 return okResult(fmt.Sprintf("slashed %d uBIGT from %s", ev.AmountSlashed, ev.ValidatorAddr))
+}
+
+func (a *App) handleObserverDispute(tx types.Tx) *abcitypes.ExecTxResult {
+var d types.ObserverDisputeTx
+if err := json.Unmarshal(tx.Payload, &d); err != nil {
+return errResult(43, err.Error())
+}
+if err := a.slashing.ProcessObserverDispute(d, a.currentSlot); err != nil {
+return errResult(44, err.Error())
+}
+return okResult(fmt.Sprintf("observer dispute opened for job %s by %s", d.JobID, d.ObserverAddr))
+}
+
+func (a *App) handleDisputeVote(tx types.Tx) *abcitypes.ExecTxResult {
+var v types.DisputeVoteTx
+if err := json.Unmarshal(tx.Payload, &v); err != nil {
+return errResult(45, err.Error())
+}
+if err := a.slashing.CastVote(v); err != nil {
+return errResult(46, err.Error())
+}
+return okResult(fmt.Sprintf("vote recorded: %s on job %s by %s", v.Vote, v.JobID, v.VoterAddr))
+}
+
+func (a *App) handleProtocolAttestation(tx types.Tx) *abcitypes.ExecTxResult {
+var att types.ProtocolAttestation
+if err := json.Unmarshal(tx.Payload, &att); err != nil {
+return errResult(47, err.Error())
+}
+// Record observer attestation for reward calculation.
+if err := a.rewards.RecordJobObserved(att.ObserverAddr, att.Epoch); err != nil {
+fmt.Fprintf(os.Stderr, "record observer attestation: %v\n", err)
+}
+return okResult(fmt.Sprintf("attestation from %s: %d jobs observed", att.ObserverAddr, att.JobsObserved))
 }
 
 func (a *App) handleRegisterValidator(tx types.Tx) *abcitypes.ExecTxResult {

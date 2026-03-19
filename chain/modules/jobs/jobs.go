@@ -1,5 +1,5 @@
-// Package jobs manages the AI job pipeline: commit-reveal, worker assignment,
-// output commitments, and majority-agreement checking.
+// Package jobs manages the AI job pipeline: commit-reveal, single-server
+// assignment, output commitment, and event emission for observer protocolling.
 package jobs
 
 import (
@@ -10,15 +10,16 @@ import (
 	"github.com/bigtchain/bigt/chain/types"
 )
 
-// JobState tracks the lifecycle of a single job across the 3-phase slot.
+// JobState tracks the lifecycle of a single job across the slot.
 type JobState int
 
 const (
 	JobCommitted  JobState = iota // CommitTx received, awaiting reveal
-	JobRevealed                   // RevealTx verified, workers routing
-	JobAgreed                     // 2-of-3 workers agree; finalised
-	JobDisputed                   // Commitment mismatch; dispute window open
-	JobFailed                     // Workers missed deadline or no quorum
+	JobRevealed                   // RevealTx verified, server routing
+	JobServed                     // Serving validator committed output hash
+	JobDisputed                   // Dispute filed; in dispute/vote window
+	JobReverted                   // Block reverted after successful dispute
+	JobFailed                     // Server missed deadline
 )
 
 // Job represents a full job record.
@@ -31,17 +32,23 @@ type Job struct {
 	Params        types.JobParams     `json:"params"`
 	State         JobState            `json:"state"`
 	Slot          int64               `json:"slot"`
-	Workers       []string            `json:"workers"`    // elected worker validator addresses
-	Commitments   []types.OutputCommitment `json:"commitments"`
-	AgreedHash    types.HexBytes      `json:"agreed_hash"` // majority-agreed output hash
+	Server        string              `json:"server"`     // VRF-elected serving validator
+	Commitment    *types.OutputCommitment `json:"commitment"` // single server commitment
 }
 
-// DisputeRecord tracks an open dispute.
+// DisputeRecord tracks an open dispute with consensus vote.
 type DisputeRecord struct {
-	JobID          string `json:"job_id"`
-	ValidatorAddr  string `json:"validator_addr"`
-	ExpiresAtSlot  int64  `json:"expires_at_slot"`
-	Resolved       bool   `json:"resolved"`
+	JobID           string `json:"job_id"`
+	ServingValidator string `json:"serving_validator"`
+	DisputerAddr    string `json:"disputer_addr"`
+	DisputeType     string `json:"dispute_type"` // "user" or "observer"
+	ExpiresAtSlot   int64  `json:"expires_at_slot"`  // end of justification window
+	VoteDeadline    int64  `json:"vote_deadline"`     // end of vote window
+	Resolved        bool   `json:"resolved"`
+	VotesUphold     int64  `json:"votes_uphold"`      // stake-weighted uphold votes
+	VotesDismiss    int64  `json:"votes_dismiss"`     // stake-weighted dismiss votes
+	Voters          map[string]bool `json:"voters"`    // tracks who already voted
+	Immediate       bool   `json:"immediate"`          // true if cryptographically provable (no vote needed)
 }
 
 var (
@@ -50,8 +57,8 @@ var (
 )
 
 func jobKey(id string) []byte      { return append(jobPrefix, []byte(id)...) }
-func disputeKey(jobID, valAddr string) []byte {
-	return []byte(fmt.Sprintf("dispute/%s/%s", jobID, valAddr))
+func disputeKey(jobID string) []byte {
+	return []byte(fmt.Sprintf("dispute/%s", jobID))
 }
 
 // Module manages the job pipeline.
@@ -63,8 +70,8 @@ type Module struct {
 func New(s *store.Store) *Module { return &Module{store: s} }
 
 // Commit registers a job request in the commit phase.
-// promptHash = keccak256(prompt || nonce) provided by the user.
-func (m *Module) Commit(req types.JobRequest, slot int64, workers []string) error {
+// server is the VRF-elected serving validator for this slot.
+func (m *Module) Commit(req types.JobRequest, slot int64, server string) error {
 	existing, err := m.GetJob(req.JobID)
 	if err != nil {
 		return err
@@ -80,7 +87,7 @@ func (m *Module) Commit(req types.JobRequest, slot int64, workers []string) erro
 		Params:     req.Params,
 		State:      JobCommitted,
 		Slot:       slot,
-		Workers:    workers,
+		Server:     server,
 	}
 	return m.putJob(j)
 }
@@ -105,58 +112,38 @@ func (m *Module) Reveal(rev types.RevealTx) error {
 	return m.putJob(j)
 }
 
-// AddCommitment records an output commitment from a worker validator.
-// Returns (agreed, error). agreed is true when 2-of-3 workers have submitted
-// matching hashes.
-func (m *Module) AddCommitment(c types.OutputCommitment) (bool, error) {
+// AddCommitment records the output commitment from the single serving validator.
+// Returns error if the committer is not the elected server.
+func (m *Module) AddCommitment(c types.OutputCommitment) error {
 	j, err := m.GetJob(c.JobID)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if j == nil {
-		return false, fmt.Errorf("job %s not found", c.JobID)
+		return fmt.Errorf("job %s not found", c.JobID)
 	}
 	if j.State != JobRevealed {
-		return false, fmt.Errorf("job %s not in revealed state", c.JobID)
+		return fmt.Errorf("job %s not in revealed state", c.JobID)
 	}
 
-	// Verify this validator is an elected worker.
-	isWorker := false
-	for _, w := range j.Workers {
-		if w == c.ValidatorAddr {
-			isWorker = true
-			break
-		}
-	}
-	if !isWorker {
-		return false, fmt.Errorf("validator %s is not an elected worker for job %s", c.ValidatorAddr, c.JobID)
+	// Only the VRF-elected serving validator can commit.
+	if c.ValidatorAddr != j.Server {
+		return fmt.Errorf("validator %s is not the elected server for job %s (expected %s)", c.ValidatorAddr, c.JobID, j.Server)
 	}
 
-	// Check for duplicate commitment from same validator.
-	for _, existing := range j.Commitments {
-		if existing.ValidatorAddr == c.ValidatorAddr {
-			return false, fmt.Errorf("duplicate commitment from validator %s for job %s", c.ValidatorAddr, c.JobID)
-		}
+	// Equivocation check: reject duplicate commitment from the server.
+	if j.Commitment != nil {
+		return fmt.Errorf("equivocation: duplicate commitment from server %s for job %s", c.ValidatorAddr, c.JobID)
 	}
 
-	j.Commitments = append(j.Commitments, c)
-
-	// Check majority agreement (2-of-3).
-	agreed, agreedHash := majority(j.Commitments)
-	if agreed {
-		j.State = JobAgreed
-		j.AgreedHash = agreedHash
-	}
-
-	if err := m.putJob(j); err != nil {
-		return false, err
-	}
-	return agreed, nil
+	j.Commitment = &c
+	j.State = JobServed
+	return m.putJob(j)
 }
 
-// FinaliseSlot sweeps all jobs in the given slot that have not reached JobAgreed
-// and marks them as JobFailed (workers missed deadline). Returns addrs of
-// validators who committed (to reset inactivity) and those who missed.
+// FinaliseSlot sweeps all jobs in the given slot that have not reached JobServed
+// and marks them as JobFailed (server missed deadline). Returns the server addr
+// if they committed, and whether they missed.
 func (m *Module) FinaliseSlot(slot int64) (committed []string, missed map[string]bool, err error) {
 	missed = make(map[string]bool)
 	err = m.store.Scan(jobPrefix, func(_, val []byte) bool {
@@ -167,27 +154,11 @@ func (m *Module) FinaliseSlot(slot int64) (committed []string, missed map[string
 		if j.Slot != slot {
 			return true
 		}
-		for _, w := range j.Workers {
-			found := false
-			for _, c := range j.Commitments {
-				if c.ValidatorAddr == w {
-					found = true
-					break
-				}
-			}
-			if found {
-				committed = append(committed, w)
-			} else {
-				missed[w] = true
-			}
-		}
-		if j.State == JobRevealed {
-			// Check for mismatch in commitments (dispute trigger)
-			if hasMismatch(j.Commitments) {
-				j.State = JobDisputed
-			} else {
-				j.State = JobFailed
-			}
+		if j.Commitment != nil {
+			committed = append(committed, j.Server)
+		} else if j.State == JobRevealed {
+			missed[j.Server] = true
+			j.State = JobFailed
 			_ = m.putJob(&j)
 		}
 		return true
@@ -195,24 +166,105 @@ func (m *Module) FinaliseSlot(slot int64) (committed []string, missed map[string
 	return
 }
 
-// OpenDispute creates a dispute record for a mismatched commitment.
-func (m *Module) OpenDispute(jobID, valAddr string, currentSlot int64) error {
+// OpenDispute creates a dispute record for a job.
+func (m *Module) OpenDispute(jobID, serverAddr, disputerAddr, disputeType string, currentSlot int64, immediate bool) error {
 	d := &DisputeRecord{
-		JobID:         jobID,
-		ValidatorAddr: valAddr,
-		ExpiresAtSlot: currentSlot + types.DisputeWindow,
-		Resolved:      false,
+		JobID:            jobID,
+		ServingValidator: serverAddr,
+		DisputerAddr:     disputerAddr,
+		DisputeType:      disputeType,
+		ExpiresAtSlot:    currentSlot + types.DisputeWindow,
+		VoteDeadline:     currentSlot + types.DisputeWindow + types.VoteWindow,
+		Resolved:         immediate, // immediately resolved if cryptographically provable
+		Immediate:        immediate,
+		Voters:           make(map[string]bool),
+	}
+	// Mark the job as disputed
+	j, err := m.GetJob(jobID)
+	if err != nil {
+		return err
+	}
+	if j != nil {
+		j.State = JobDisputed
+		if err := m.putJob(j); err != nil {
+			return err
+		}
 	}
 	data, err := json.Marshal(d)
 	if err != nil {
 		return err
 	}
-	return m.store.Set(disputeKey(jobID, valAddr), data)
+	return m.store.Set(disputeKey(jobID), data)
+}
+
+// CastVote records a validator's vote on a dispute. Returns error if already voted.
+func (m *Module) CastVote(jobID, voterAddr, vote string, voterStake int64) error {
+	d, err := m.GetDispute(jobID)
+	if err != nil {
+		return err
+	}
+	if d == nil {
+		return fmt.Errorf("no dispute found for job %s", jobID)
+	}
+	if d.Resolved {
+		return fmt.Errorf("dispute for job %s already resolved", jobID)
+	}
+	if d.Voters[voterAddr] {
+		return fmt.Errorf("validator %s already voted on dispute for job %s", voterAddr, jobID)
+	}
+	d.Voters[voterAddr] = true
+	switch vote {
+	case "uphold":
+		d.VotesUphold += voterStake
+	case "dismiss":
+		d.VotesDismiss += voterStake
+	default:
+		return fmt.Errorf("invalid vote: %s (expected uphold or dismiss)", vote)
+	}
+	data, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	return m.store.Set(disputeKey(jobID), data)
+}
+
+// ResolveDispute marks a dispute as resolved.
+func (m *Module) ResolveDispute(jobID string) error {
+	d, err := m.GetDispute(jobID)
+	if err != nil {
+		return err
+	}
+	if d == nil {
+		return fmt.Errorf("no dispute found for job %s", jobID)
+	}
+	d.Resolved = true
+	data, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	return m.store.Set(disputeKey(jobID), data)
+}
+
+// RevertJob marks a job as reverted (block reversion). Returns the job for re-queuing.
+func (m *Module) RevertJob(jobID string) (*Job, error) {
+	j, err := m.GetJob(jobID)
+	if err != nil {
+		return nil, err
+	}
+	if j == nil {
+		return nil, fmt.Errorf("job %s not found", jobID)
+	}
+	j.State = JobReverted
+	j.Commitment = nil
+	if err := m.putJob(j); err != nil {
+		return nil, err
+	}
+	return j, nil
 }
 
 // GetDispute retrieves an open dispute record.
-func (m *Module) GetDispute(jobID, valAddr string) (*DisputeRecord, error) {
-	data, err := m.store.Get(disputeKey(jobID, valAddr))
+func (m *Module) GetDispute(jobID string) (*DisputeRecord, error) {
+	data, err := m.store.Get(disputeKey(jobID))
 	if err != nil || data == nil {
 		return nil, err
 	}
@@ -223,21 +275,20 @@ func (m *Module) GetDispute(jobID, valAddr string) (*DisputeRecord, error) {
 	return &d, nil
 }
 
-// ResolveDispute marks a dispute as resolved.
-func (m *Module) ResolveDispute(jobID, valAddr string) error {
-	d, err := m.GetDispute(jobID, valAddr)
-	if err != nil {
-		return err
-	}
-	if d == nil {
-		return fmt.Errorf("no dispute found for job %s validator %s", jobID, valAddr)
-	}
-	d.Resolved = true
-	data, err := json.Marshal(d)
-	if err != nil {
-		return err
-	}
-	return m.store.Set(disputeKey(jobID, valAddr), data)
+// ListOpenDisputes returns all unresolved disputes that have passed their vote deadline.
+func (m *Module) ListOpenDisputes(currentSlot int64) ([]*DisputeRecord, error) {
+	var disputes []*DisputeRecord
+	err := m.store.Scan(disputePrefix, func(_, val []byte) bool {
+		var d DisputeRecord
+		if err := json.Unmarshal(val, &d); err != nil {
+			return false
+		}
+		if !d.Resolved && currentSlot >= d.VoteDeadline {
+			disputes = append(disputes, &d)
+		}
+		return true
+	})
+	return disputes, err
 }
 
 // GetJob retrieves a job by ID. Returns (nil, nil) if not found.
@@ -253,7 +304,7 @@ func (m *Module) GetJob(id string) (*Job, error) {
 	return &j, nil
 }
 
-// ComputeOutputHash computes the canonical output hash that workers must commit to.
+// ComputeOutputHash computes the canonical output hash that the serving validator must commit to.
 // output_hash = keccak256(output_tokens || job_id || validator_pubkey)
 func ComputeOutputHash(outputTokens []byte, jobID, validatorPubKey string) []byte {
 	return types.Keccak256(outputTokens, []byte(jobID), []byte(validatorPubKey))
@@ -265,35 +316,4 @@ func (m *Module) putJob(j *Job) error {
 		return err
 	}
 	return m.store.Set(jobKey(j.JobID), data)
-}
-
-// majority returns true and the winning hash if 2+ commitments have the same hash.
-func majority(cs []types.OutputCommitment) (bool, types.HexBytes) {
-	counts := make(map[string]int)
-	hashes := make(map[string]types.HexBytes)
-	for _, c := range cs {
-		key := fmt.Sprintf("%x", c.OutputHash)
-		counts[key]++
-		hashes[key] = c.OutputHash
-	}
-	for k, cnt := range counts {
-		if cnt >= 2 {
-			return true, hashes[k]
-		}
-	}
-	return false, nil
-}
-
-// hasMismatch returns true if at least two commitments with different hashes exist.
-func hasMismatch(cs []types.OutputCommitment) bool {
-	if len(cs) < 2 {
-		return false
-	}
-	ref := fmt.Sprintf("%x", cs[0].OutputHash)
-	for _, c := range cs[1:] {
-		if fmt.Sprintf("%x", c.OutputHash) != ref {
-			return true
-		}
-	}
-	return false
 }

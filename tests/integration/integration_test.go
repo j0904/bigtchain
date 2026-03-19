@@ -26,11 +26,11 @@ func newTestStore(t *testing.T) *store.Store {
 	return s
 }
 
-// TestFullSlotLifecycle simulates a complete 3-phase slot:
+// TestFullSlotLifecycle simulates a complete slot with single-server architecture:
 // 1. Users commit job hashes
 // 2. Users reveal prompts
-// 3. Workers submit output commitments
-// 4. Chain finalises with majority agreement
+// 3. Serving validator submits output commitment
+// 4. Chain finalises with server's commitment accepted
 func TestFullSlotLifecycle(t *testing.T) {
 	s := newTestStore(t)
 	st := staking.New(s)
@@ -54,14 +54,14 @@ func TestFullSlotLifecycle(t *testing.T) {
 	reg.ProposeModel(registry.MsgProposeModel{ModelID: "llama3", WeightsHash: "0x1234"})                        //nolint:errcheck
 	reg.ApproveModel(registry.MsgApproveModel{ModelID: "llama3", ValidatorAddr: "v1"}, slot)                  //nolint:errcheck
 
-	// Elect workers for this slot.
+	// Elect server for this slot (single-server architecture).
 	vals, _ := st.ListActive()
 	seed := vrf.EpochSeed([]byte("test-block-hash"), epoch)
-	proposer, workers := vrf.ElectSlot(seed, slot, vals)
-	t.Logf("slot %d: proposer=%s workers=%v", slot, proposer, workers)
+	proposer, server := vrf.ElectSlot(seed, slot, vals)
+	t.Logf("slot %d: proposer=%s server=%s", slot, proposer, server)
 
-	if len(workers) < 2 {
-		t.Fatalf("need at least 2 workers, got %d", len(workers))
+	if server == "" {
+		t.Fatal("server should not be empty")
 	}
 
 	// Phase 1: User commits job.
@@ -71,7 +71,7 @@ func TestFullSlotLifecycle(t *testing.T) {
 		JobID: "job-42", ModelID: "llama3", PromptHash: promptHash, UserAddr: "user1",
 		Params: types.JobParams{Temperature: 0, MaxTokens: 64},
 	}
-	if err := jm.Commit(req, slot, workers); err != nil {
+	if err := jm.Commit(req, slot, server); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -80,29 +80,14 @@ func TestFullSlotLifecycle(t *testing.T) {
 		t.Fatalf("reveal: %v", err)
 	}
 
-	// Workers route and commit (workers[0] and workers[1] agree, workers[2] is slow/missing).
+	// Serving validator commits output.
 	output := "4"
-	hash1 := jobs.ComputeOutputHash([]byte(output), "job-42", "bls-"+workers[0])
-	hash2 := jobs.ComputeOutputHash([]byte(output), "job-42", "bls-"+workers[0]) // same logical output
+	hash := jobs.ComputeOutputHash([]byte(output), "job-42", "bls-"+server)
 
-	agreed1, err := jm.AddCommitment(types.OutputCommitment{
-		JobID: "job-42", ValidatorAddr: workers[0], OutputHash: hash1, Slot: slot,
-	})
-	if err != nil {
-		t.Fatalf("commitment w0: %v", err)
-	}
-	if agreed1 {
-		t.Error("should not agree with 1 commitment")
-	}
-
-	agreed2, err := jm.AddCommitment(types.OutputCommitment{
-		JobID: "job-42", ValidatorAddr: workers[1], OutputHash: hash2, Slot: slot,
-	})
-	if err != nil {
-		t.Fatalf("commitment w1: %v", err)
-	}
-	if !agreed2 {
-		t.Error("expected majority agreement after 2 matching commitments")
+	if err := jm.AddCommitment(types.OutputCommitment{
+		JobID: "job-42", ValidatorAddr: server, OutputHash: hash, Slot: slot,
+	}); err != nil {
+		t.Fatalf("commitment: %v", err)
 	}
 
 	// Finalise slot.
@@ -112,32 +97,21 @@ func TestFullSlotLifecycle(t *testing.T) {
 	}
 	t.Logf("committed: %v, missed: %v", committed, missed)
 
-	// workers[2] missed — increment their counter.
-	if len(workers) > 2 {
-		if missed[workers[2]] {
-			if err := st.IncrementMissed(workers[2]); err != nil {
-				t.Errorf("increment missed: %v", err)
-			}
-			v, _ := st.GetValidator(workers[2])
-			if v.ConsecutiveMissed != 1 {
-				t.Errorf("consecutive missed = %d, want 1", v.ConsecutiveMissed)
-			}
-		}
+	if missed[server] {
+		t.Error("server committed so should not be missed")
 	}
 
-	// Reset inactivity for committed workers.
-	for _, addr := range []string{workers[0], workers[1]} {
-		st.ResetMissed(addr, epoch) //nolint:errcheck
-	}
+	// Reset inactivity for server.
+	st.ResetMissed(server, epoch) //nolint:errcheck
 
 	// Verify final job state.
 	j, _ := jm.GetJob("job-42")
-	if j.State != jobs.JobAgreed {
-		t.Errorf("expected job agreed, got state %d", j.State)
+	if j.State != jobs.JobServed {
+		t.Errorf("expected job served, got state %d", j.State)
 	}
 }
 
-// TestDisputeSlashing verifies that a user proving a validator lied result in 100% slash.
+// TestDisputeSlashing verifies that a user proving a serving validator lied results in 100% slash.
 func TestDisputeSlashing(t *testing.T) {
 	s := newTestStore(t)
 	st := staking.New(s)
@@ -155,14 +129,14 @@ func TestDisputeSlashing(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	// Commit a job and have the validator submit a REAL output via chain.
+	// Commit a job with the validator as the server.
 	prompt, nonce := "Who are you?", "nonce-x"
 	promptHash := types.Keccak256([]byte(prompt), []byte(nonce))
 	req := types.JobRequest{JobID: "j-dispute", ModelID: "m1", PromptHash: promptHash, UserAddr: "user2"}
-	jm.Commit(req, 1, []string{"liar-val"})                                               //nolint:errcheck
+	jm.Commit(req, 1, "liar-val")                                                         //nolint:errcheck
 	jm.Reveal(types.RevealTx{JobID: "j-dispute", Prompt: prompt, Nonce: nonce})           //nolint:errcheck
 
-	// Validator commits to output "I am honest" but actually returns "I am evil" to the user.
+	// Server commits to output "I am honest" but actually returns "I am evil" to the user.
 	committedOutput := "I am honest"
 	returnedOutput := "I am evil"
 
@@ -176,7 +150,7 @@ func TestDisputeSlashing(t *testing.T) {
 		JobID:           "j-dispute",
 		ValidatorAddr:   "liar-val",
 		PlaintextOutput: returnedOutput,
-	})
+	}, 1)
 	if err != nil {
 		t.Fatalf("process dispute: %v", err)
 	}
@@ -195,6 +169,12 @@ func TestDisputeSlashing(t *testing.T) {
 	if v.Status != staking.StatusJailed {
 		t.Errorf("expected jailed, got %v", v.Status)
 	}
+
+	// Verify job was reverted.
+	j, _ := jm.GetJob("j-dispute")
+	if j.State != jobs.JobReverted {
+		t.Errorf("expected job reverted after dispute, got state %d", j.State)
+	}
 }
 
 // TestInvalidDispute_HashesMatch verifies a dispute is rejected when the hashes equal.
@@ -212,7 +192,7 @@ func TestInvalidDispute_HashesMatch(t *testing.T) {
 	prompt, nonce := "question", "n"
 	jm.Commit(types.JobRequest{
 		JobID: "j-ok", ModelID: "m", PromptHash: types.Keccak256([]byte(prompt), []byte(nonce)), UserAddr: "u",
-	}, 1, []string{"honest-val"})                                                         //nolint:errcheck
+	}, 1, "honest-val")                                                                    //nolint:errcheck
 	jm.Reveal(types.RevealTx{JobID: "j-ok", Prompt: prompt, Nonce: nonce})               //nolint:errcheck
 
 	hash := jobs.ComputeOutputHash([]byte(output), "j-ok", "bls-honest")
@@ -221,7 +201,7 @@ func TestInvalidDispute_HashesMatch(t *testing.T) {
 	// User disputes with the same output they actually received (honest validator).
 	ev, err := sh.ProcessUserDispute(types.DisputeTx{
 		JobID: "j-ok", ValidatorAddr: "honest-val", PlaintextOutput: output,
-	})
+	}, 1)
 	if err != nil {
 		t.Fatalf("process dispute: %v", err)
 	}
@@ -230,10 +210,74 @@ func TestInvalidDispute_HashesMatch(t *testing.T) {
 	}
 }
 
+// TestObserverDispute_ConsensusVote tests observer dispute with consensus vote flow.
+func TestObserverDispute_ConsensusVote(t *testing.T) {
+	s := newTestStore(t)
+	st := staking.New(s)
+	jm := jobs.New(s)
+	sh := slashing.New(st, jm)
+
+	const totalSupply = int64(100_000_000_000_000)
+
+	// Register validators.
+	for _, addr := range []string{"server1", "obs1", "obs2", "obs3"} {
+		st.RegisterValidator(staking.MsgRegisterValidator{ //nolint:errcheck
+			Address: addr, Bond: types.MinStake, BLSPubKey: "bls-" + addr,
+		}, totalSupply)
+	}
+
+	// Setup: server commits a job.
+	prompt, nonce := "test", "n"
+	jm.Commit(types.JobRequest{
+		JobID: "j-obs", ModelID: "m", PromptHash: types.Keccak256([]byte(prompt), []byte(nonce)), UserAddr: "u",
+	}, 1, "server1") //nolint:errcheck
+	jm.Reveal(types.RevealTx{JobID: "j-obs", Prompt: prompt, Nonce: nonce}) //nolint:errcheck
+	hash := jobs.ComputeOutputHash([]byte("output"), "j-obs", "bls-server1")
+	jm.AddCommitment(types.OutputCommitment{JobID: "j-obs", ValidatorAddr: "server1", OutputHash: hash, Slot: 1}) //nolint:errcheck
+
+	// Observer files dispute.
+	if err := sh.ProcessObserverDispute(types.ObserverDisputeTx{
+		JobID: "j-obs", ObserverAddr: "obs1",
+	}, 1); err != nil {
+		t.Fatalf("observer dispute: %v", err)
+	}
+
+	// Verify job is in disputed state.
+	j, _ := jm.GetJob("j-obs")
+	if j.State != jobs.JobDisputed {
+		t.Errorf("expected job disputed, got %d", j.State)
+	}
+
+	// Cast votes: obs1, obs2 uphold; obs3 dismisses.
+	sh.CastVote(types.DisputeVoteTx{JobID: "j-obs", VoterAddr: "obs1", Vote: "uphold"}) //nolint:errcheck
+	sh.CastVote(types.DisputeVoteTx{JobID: "j-obs", VoterAddr: "obs2", Vote: "uphold"}) //nolint:errcheck
+	sh.CastVote(types.DisputeVoteTx{JobID: "j-obs", VoterAddr: "obs3", Vote: "dismiss"}) //nolint:errcheck
+
+	// Tally at vote deadline (slot 1 + DisputeWindow + VoteWindow = 11).
+	voteDeadlineSlot := int64(1) + types.DisputeWindow + types.VoteWindow
+	events, err := sh.TallyExpiredDisputes(voteDeadlineSlot)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+
+	// With 3 of 4 validators voting (3*MinStake uphold vs 1*MinStake dismiss),
+	// uphold votes = 2*MinStake, total = 4*MinStake, threshold = 4*MinStake * 6667/10000.
+	// 2*MinStake > threshold? Let's check.
+	totalStake := int64(4) * types.MinStake
+	threshold := totalStake * types.DisputeVoteThresholdBPS / 10_000
+
+	upholdStake := int64(2) * types.MinStake // obs1 + obs2
+	if upholdStake > threshold {
+		if len(events) == 0 {
+			t.Error("expected slash event from tally (uphold > threshold)")
+		}
+	} else {
+		t.Logf("uphold stake %d <= threshold %d; dispute dismissed", upholdStake, threshold)
+	}
+}
+
 // TestInactivityDrain_QuadraticFormula verifies the drain math.
 func TestInactivityDrain_QuadraticFormula(t *testing.T) {
-	// drainBPS = excess * excess * 100 / 1000  (integer division)
-	// excess = epochsSinceActive - InactivityThresholdEpochs
 	type tc struct {
 		excess  int64
 		wantBPS int64

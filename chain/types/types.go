@@ -15,17 +15,28 @@ const (
 	MaxValidatorPct = int64(5)               // 5% of total stake
 	SlotSeconds     = int64(6)
 	EpochSlots      = int64(14_400)
-	DisputeWindow   = int64(7) // slots
-	CommitDeadline  = int64(4) // seconds into slot
+	DisputeWindow   = int64(7)  // slots for justification
+	VoteWindow      = int64(3)  // slots for consensus vote after dispute window
+	CommitDeadline  = int64(4)  // seconds into slot
 
 	// Slashing amounts (basis points of bond)
-	SlashMismatch  = int64(1000) // 10%
-	SlashMalicious = int64(10000) // 100%
+	SlashMismatch  = int64(1000)  // 10% — observer-detected mismatch
+	SlashMalicious = int64(10000) // 100% — user dispute or equivocation
 
-	WorkersPerJob  = 3
+	// Single-server architecture: 1 serving validator per slot
+	ServersPerJob  = 1
 	BFTCommitteeSize = 128
 	InactivityThresholdEpochs = 4
 	UnbondingSlots = 21 * 24 * EpochSlots / EpochSlots * EpochSlots // 21 days in slots
+
+	// Revenue sharing (basis points of total job revenue)
+	RewardServingBPS  = int64(5000) // 50% to serving validator
+	RewardObserverBPS = int64(3000) // 30% to observer pool
+	RewardDelegatorBPS = int64(1500) // 15% to delegators
+	RewardBountyBPS   = int64(500)  // 5% to dispute bounty reserve
+
+	// Dispute vote threshold: 2/3+ of active stake (in basis points)
+	DisputeVoteThresholdBPS = int64(6667) // 66.67%
 )
 
 // Keccak256 computes keccak256 of the input data.
@@ -110,9 +121,34 @@ type OutputCommitment struct {
 
 // DisputeTx is submitted by a user who received an output not matching the commitment.
 type DisputeTx struct {
-	JobID          string `json:"job_id"`
-	ValidatorAddr  string `json:"validator_addr"`
+	JobID           string `json:"job_id"`
+	ValidatorAddr   string `json:"validator_addr"`
 	PlaintextOutput string `json:"plaintext_output"`
+}
+
+// ObserverDisputeTx is submitted by an observer who re-executed inference and found a mismatch.
+type ObserverDisputeTx struct {
+	JobID             string   `json:"job_id"`
+	ObserverAddr      string   `json:"observer_addr"`
+	ObserverOutputHash HexBytes `json:"observer_output_hash"`
+	Signature         HexBytes `json:"signature"`
+}
+
+// DisputeVoteTx is cast by a validator to uphold or dismiss a dispute.
+type DisputeVoteTx struct {
+	JobID         string `json:"job_id"`
+	VoterAddr     string `json:"voter_addr"`
+	Vote          string `json:"vote"` // "uphold" or "dismiss"
+	Signature     HexBytes `json:"signature"`
+}
+
+// ProtocolAttestation is submitted by observer validators at epoch boundary.
+type ProtocolAttestation struct {
+	Epoch          int64    `json:"epoch"`
+	ObserverAddr   string   `json:"observer_addr"`
+	JobsObserved   int64    `json:"jobs_observed"`
+	JobsVerified   int64    `json:"jobs_verified"`
+	Signature      HexBytes `json:"signature"`
 }
 
 // JustificationTx is submitted by a validator to justify a mismatched commitment.
@@ -131,17 +167,20 @@ type JustificationTx struct {
 type TxType string
 
 const (
-	TxJobRequest      TxType = "job_request"
-	TxReveal          TxType = "reveal"
-	TxCommitment      TxType = "commitment"
-	TxDispute         TxType = "dispute"
-	TxJustification   TxType = "justification"
-	TxRegValidator    TxType = "register_validator"
-	TxDelegate        TxType = "delegate"
-	TxUndelegate      TxType = "undelegate"
-	TxUnjail          TxType = "unjail"
-	TxProposeModel    TxType = "propose_model"
-	TxApproveModel    TxType = "approve_model"
+	TxJobRequest        TxType = "job_request"
+	TxReveal            TxType = "reveal"
+	TxCommitment        TxType = "commitment"
+	TxDispute           TxType = "dispute"
+	TxObserverDispute   TxType = "observer_dispute"
+	TxDisputeVote       TxType = "dispute_vote"
+	TxJustification     TxType = "justification"
+	TxProtocolAttestation TxType = "protocol_attestation"
+	TxRegValidator      TxType = "register_validator"
+	TxDelegate          TxType = "delegate"
+	TxUndelegate        TxType = "undelegate"
+	TxUnjail            TxType = "unjail"
+	TxProposeModel      TxType = "propose_model"
+	TxApproveModel      TxType = "approve_model"
 )
 
 // Tx is the generic transaction envelope used in DeliverTx.

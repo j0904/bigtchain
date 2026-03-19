@@ -20,23 +20,21 @@ func makeValidators(addrs ...string) []*staking.Validator {
 	return vals
 }
 
-func TestElectSlot_ReturnsProposerAndWorkers(t *testing.T) {
+func TestElectSlot_ReturnsProposerAndServer(t *testing.T) {
 	seed := []byte("test-epoch-seed-000")
 	vals := makeValidators("val1", "val2", "val3", "val4", "val5")
 
-	proposer, workers := vrf.ElectSlot(seed, 1, vals)
+	proposer, server := vrf.ElectSlot(seed, 1, vals)
 
 	if proposer == "" {
 		t.Fatal("proposer should not be empty")
 	}
-	if len(workers) != 3 {
-		t.Errorf("expected 3 workers, got %d", len(workers))
+	if server == "" {
+		t.Fatal("server should not be empty")
 	}
-	// Proposer must not appear in workers.
-	for _, w := range workers {
-		if w == proposer {
-			t.Errorf("proposer %s also appears in workers", proposer)
-		}
+	// Proposer must not be the server (with enough validators).
+	if proposer == server {
+		t.Errorf("proposer %s should not be the same as server %s", proposer, server)
 	}
 }
 
@@ -44,16 +42,14 @@ func TestElectSlot_Deterministic(t *testing.T) {
 	seed := []byte("deterministic-seed")
 	vals := makeValidators("a", "b", "c", "d", "e")
 
-	p1, w1 := vrf.ElectSlot(seed, 42, vals)
-	p2, w2 := vrf.ElectSlot(seed, 42, vals)
+	p1, s1 := vrf.ElectSlot(seed, 42, vals)
+	p2, s2 := vrf.ElectSlot(seed, 42, vals)
 
 	if p1 != p2 {
 		t.Errorf("proposer not deterministic: %s != %s", p1, p2)
 	}
-	for i := range w1 {
-		if w1[i] != w2[i] {
-			t.Errorf("worker[%d] not deterministic: %s != %s", i, w1[i], w2[i])
-		}
+	if s1 != s2 {
+		t.Errorf("server not deterministic: %s != %s", s1, s2)
 	}
 }
 
@@ -64,7 +60,6 @@ func TestElectSlot_DifferentSlotsGiveDifferentElections(t *testing.T) {
 	p1, _ := vrf.ElectSlot(seed, 1, vals)
 	p2, _ := vrf.ElectSlot(seed, 2, vals)
 	// Very unlikely to be the same (1/5 chance per validator set of 5).
-	// We test over many slots that not all are the same proposer.
 	sameCount := 0
 	for slot := int64(1); slot <= 20; slot++ {
 		px, _ := vrf.ElectSlot(seed, slot, vals)
@@ -78,13 +73,28 @@ func TestElectSlot_DifferentSlotsGiveDifferentElections(t *testing.T) {
 	_ = p2
 }
 
-func TestElectSlot_TooFewValidators(t *testing.T) {
+func TestElectSlot_SingleValidator(t *testing.T) {
 	seed := []byte("seed")
-	// Only 2 validators; should return proposer + 1 worker (not 3).
+	vals := makeValidators("v1")
+	proposer, server := vrf.ElectSlot(seed, 1, vals)
+	if proposer != "v1" {
+		t.Errorf("expected v1 as proposer, got %s", proposer)
+	}
+	// With only 1 validator, proposer and server are the same.
+	if server != "v1" {
+		t.Errorf("expected v1 as server with 1 validator, got %s", server)
+	}
+}
+
+func TestElectSlot_TwoValidators(t *testing.T) {
+	seed := []byte("seed")
 	vals := makeValidators("v1", "v2")
-	_, workers := vrf.ElectSlot(seed, 1, vals)
-	if len(workers) != 1 {
-		t.Errorf("expected 1 worker with 2 validators, got %d", len(workers))
+	proposer, server := vrf.ElectSlot(seed, 1, vals)
+	if proposer == "" || server == "" {
+		t.Fatal("proposer and server should both be assigned")
+	}
+	if proposer == server {
+		t.Error("proposer and server should differ with 2 validators")
 	}
 }
 
@@ -97,9 +107,8 @@ func TestElectSlot_JailedExcluded(t *testing.T) {
 		{Address: "active3", TotalStake: 10_000_000_000, Status: staking.StatusActive},
 		{Address: "active4", TotalStake: 10_000_000_000, Status: staking.StatusActive},
 	}
-	proposer, workers := vrf.ElectSlot(seed, 1, vals)
-	all := append([]string{proposer}, workers...)
-	for _, addr := range all {
+	proposer, server := vrf.ElectSlot(seed, 1, vals)
+	for _, addr := range []string{proposer, server} {
 		if addr == "jailed1" {
 			t.Errorf("jailed validator was elected: %s", addr)
 		}

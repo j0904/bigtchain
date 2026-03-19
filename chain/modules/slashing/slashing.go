@@ -1,4 +1,7 @@
-// Package slashing implements the slashing and dispute resolution logic.
+// Package slashing implements dispute resolution, consensus voting, and slashing.
+// Under the single-server architecture, disputes are raised by users or observers,
+// then resolved either immediately (cryptographic proof) or via 2/3+ stake-weighted
+// consensus vote among active validators.
 package slashing
 
 import (
@@ -18,7 +21,7 @@ type Event struct {
 	JobID         string
 }
 
-// Handler processes disputes and equivocation.
+// Handler processes disputes, consensus votes, and equivocation.
 type Handler struct {
 	staking *staking.Module
 	jobs    *jobs.Module
@@ -31,9 +34,10 @@ func New(st *staking.Module, jm *jobs.Module) *Handler {
 
 // ProcessUserDispute handles a DisputeTx submitted by a user.
 // The user provides the plaintext output; we recompute its hash on-chain and
-// compare to the validator's committed hash.
-// Returns a slash event if the validator lied; returns nil if dispute is invalid.
-func (h *Handler) ProcessUserDispute(tx types.DisputeTx) (*Event, error) {
+// compare to the serving validator's committed hash.
+// If hashes don't match, this is cryptographically provable fraud → immediate slash + revert.
+// Returns a slash event if proven; nil if dispute is invalid.
+func (h *Handler) ProcessUserDispute(tx types.DisputeTx, currentSlot int64) (*Event, error) {
 	j, err := h.jobs.GetJob(tx.JobID)
 	if err != nil {
 		return nil, err
@@ -42,20 +46,15 @@ func (h *Handler) ProcessUserDispute(tx types.DisputeTx) (*Event, error) {
 		return nil, fmt.Errorf("job %s not found", tx.JobID)
 	}
 
-	// Find the validator's commitment in this job.
-	var committed types.HexBytes
-	for _, c := range j.Commitments {
-		if c.ValidatorAddr == tx.ValidatorAddr {
-			committed = c.OutputHash
-			break
-		}
+	// Single-server: check the server's commitment directly.
+	if j.Commitment == nil {
+		return nil, fmt.Errorf("no commitment found for job %s", tx.JobID)
 	}
-	if committed == nil {
-		return nil, fmt.Errorf("no commitment found for validator %s in job %s", tx.ValidatorAddr, tx.JobID)
+	if j.Commitment.ValidatorAddr != tx.ValidatorAddr {
+		return nil, fmt.Errorf("validator %s is not the server for job %s", tx.ValidatorAddr, tx.JobID)
 	}
 
-	// Recompute expected hash.
-	// Get validator's BLS pubkey for hash computation.
+	// Recompute expected hash using validator's BLS pubkey.
 	v, err := h.staking.GetValidator(tx.ValidatorAddr)
 	if err != nil {
 		return nil, err
@@ -66,16 +65,25 @@ func (h *Handler) ProcessUserDispute(tx types.DisputeTx) (*Event, error) {
 
 	expected := jobs.ComputeOutputHash([]byte(tx.PlaintextOutput), tx.JobID, v.BLSPubKey)
 
-	if bytes.Equal(expected, committed) {
-		// Hashes match — dispute invalid. Fee burned by caller logic.
+	if bytes.Equal(expected, j.Commitment.OutputHash) {
+		// Hashes match — dispute invalid.
 		return nil, nil
 	}
 
-	// Validator lied: 100% slash.
+	// Cryptographically provable fraud → immediate slash (no vote needed).
 	amount, err := h.staking.SlashBond(tx.ValidatorAddr, types.SlashMalicious)
 	if err != nil {
 		return nil, err
 	}
+
+	// Open an immediate dispute and revert the job.
+	if err := h.jobs.OpenDispute(tx.JobID, tx.ValidatorAddr, tx.ValidatorAddr, "user", currentSlot, true); err != nil {
+		return nil, err
+	}
+	if _, err := h.jobs.RevertJob(tx.JobID); err != nil {
+		return nil, err
+	}
+
 	return &Event{
 		ValidatorAddr: tx.ValidatorAddr,
 		AmountSlashed: amount,
@@ -84,20 +92,91 @@ func (h *Handler) ProcessUserDispute(tx types.DisputeTx) (*Event, error) {
 	}, nil
 }
 
-// ProcessMismatch handles the case where 1-of-3 worker commitments diverged from
-// the majority. Called from EndBlock when a dispute window expires without justification.
-// Returns a slash event for the minority validator.
-func (h *Handler) ProcessMismatch(jobID, validatorAddr string) (*Event, error) {
-	amount, err := h.staking.SlashBond(validatorAddr, types.SlashMismatch)
+// ProcessObserverDispute handles an ObserverDisputeTx from a validator who
+// re-executed inference and found a mismatch. Opens a dispute vote window.
+func (h *Handler) ProcessObserverDispute(tx types.ObserverDisputeTx, currentSlot int64) error {
+	j, err := h.jobs.GetJob(tx.JobID)
+	if err != nil {
+		return err
+	}
+	if j == nil {
+		return fmt.Errorf("job %s not found", tx.JobID)
+	}
+	if j.Commitment == nil {
+		return fmt.Errorf("no commitment to dispute for job %s", tx.JobID)
+	}
+
+	// Verify the observer is an active validator (not the server).
+	observer, err := h.staking.GetValidator(tx.ObserverAddr)
+	if err != nil {
+		return err
+	}
+	if observer == nil || observer.Status != staking.StatusActive {
+		return fmt.Errorf("observer %s is not an active validator", tx.ObserverAddr)
+	}
+	if tx.ObserverAddr == j.Server {
+		return fmt.Errorf("server cannot dispute its own job")
+	}
+
+	// Open a dispute with consensus vote window; not immediately resolved.
+	return h.jobs.OpenDispute(tx.JobID, j.Server, tx.ObserverAddr, "observer", currentSlot, false)
+}
+
+// CastVote records a validator's stake-weighted vote on a dispute.
+func (h *Handler) CastVote(tx types.DisputeVoteTx) error {
+	v, err := h.staking.GetValidator(tx.VoterAddr)
+	if err != nil {
+		return err
+	}
+	if v == nil || v.Status != staking.StatusActive {
+		return fmt.Errorf("voter %s is not an active validator", tx.VoterAddr)
+	}
+	return h.jobs.CastVote(tx.JobID, tx.VoterAddr, tx.Vote, v.TotalStake)
+}
+
+// TallyExpiredDisputes checks disputes whose vote deadline has passed,
+// tallies votes, and applies slashing/reversion if upheld.
+// Returns slash events for upheld disputes.
+func (h *Handler) TallyExpiredDisputes(currentSlot int64) ([]Event, error) {
+	disputes, err := h.jobs.ListOpenDisputes(currentSlot)
 	if err != nil {
 		return nil, err
 	}
-	return &Event{
-		ValidatorAddr: validatorAddr,
-		AmountSlashed: amount,
-		Reason:        "commitment_mismatch_unjustified",
-		JobID:         jobID,
-	}, nil
+
+	totalStake, err := h.staking.TotalStake()
+	if err != nil {
+		return nil, err
+	}
+	if totalStake == 0 {
+		return nil, nil
+	}
+
+	var events []Event
+	for _, d := range disputes {
+		// Threshold: uphold votes > DisputeVoteThresholdBPS * totalStake / 10000
+		threshold := totalStake * types.DisputeVoteThresholdBPS / 10_000
+		if d.VotesUphold > threshold {
+			// Dispute upheld — slash serving validator and revert job.
+			amount, err := h.staking.SlashBond(d.ServingValidator, types.SlashMismatch)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := h.jobs.RevertJob(d.JobID); err != nil {
+				return nil, err
+			}
+			events = append(events, Event{
+				ValidatorAddr: d.ServingValidator,
+				AmountSlashed: amount,
+				Reason:        "observer_dispute_upheld",
+				JobID:         d.JobID,
+			})
+		}
+		// Mark dispute as resolved regardless of outcome.
+		if err := h.jobs.ResolveDispute(d.JobID); err != nil {
+			return nil, err
+		}
+	}
+	return events, nil
 }
 
 // ProcessEquivocation handles a validator submitting two different commitments

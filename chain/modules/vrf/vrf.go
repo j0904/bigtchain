@@ -1,4 +1,4 @@
-// Package vrf implements VRF-based slot election for proposer and worker validators.
+// Package vrf implements VRF-based slot election for proposer and a single serving validator.
 // We use a deterministic pseudorandom sort as a placeholder; a production
 // implementation should use ECVRF (IETF draft-irtf-cfrg-vrf-15) with the
 // validator's ed25519 consensus key.
@@ -19,14 +19,15 @@ type Proof struct {
 	Stake         int64
 }
 
-// ElectSlot selects 1 proposer and up to WorkersPerJob workers from the active
+// ElectSlot selects 1 proposer and 1 serving validator from the active
 // validator set for the given slot. epochSeed is committed at epoch start.
 //
 // Selection: compute hash = keccak256(epochSeed || slotNumber || validatorAddr)
-// for each active validator, sort ascending. Lowest hash = proposer; next three
-// = workers. Validators stake-weights the sort via a secondary sort on stake
+// for each active validator, sort ascending. Lowest hash = proposer; second
+// lowest = serving validator. All other active validators are observers.
+// Validators stake-weights the sort via a secondary sort on stake
 // (higher stake breaks ties in favour of the validator).
-func ElectSlot(epochSeed []byte, slot int64, validators []*staking.Validator) (proposer string, workers []string) {
+func ElectSlot(epochSeed []byte, slot int64, validators []*staking.Validator) (proposer string, server string) {
 	slotBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(slotBytes, uint64(slot))
 
@@ -54,13 +55,16 @@ func ElectSlot(epochSeed []byte, slot int64, validators []*staking.Validator) (p
 	})
 
 	if len(proofs) == 0 {
-		return "", nil
+		return "", ""
 	}
 	proposer = proofs[0].ValidatorAddr
-	for i := 1; i <= types.WorkersPerJob && i < len(proofs); i++ {
-		workers = append(workers, proofs[i].ValidatorAddr)
+	if len(proofs) > 1 {
+		server = proofs[1].ValidatorAddr
+	} else {
+		// Only one active validator: it serves as both proposer and server
+		server = proofs[0].ValidatorAddr
 	}
-	return proposer, workers
+	return proposer, server
 }
 
 // EpochSeed derives the epoch seed from the last block hash of the previous epoch.
