@@ -37,6 +37,17 @@ const (
 
 	// Dispute vote threshold: 2/3+ of active stake (in basis points)
 	DisputeVoteThresholdBPS = int64(6667) // 66.67%
+
+	// Subscription plans (monthly, in uBIGT)
+	SubscriptionBasicMonthly = int64(10_000_000)   // 10 BIGT/month — 100 jobs/month
+	SubscriptionProMonthly   = int64(50_000_000)   // 50 BIGT/month — 1,000 jobs/month
+	SubscriptionEnterpriseMonthly = int64(200_000_000) // 200 BIGT/month — unlimited
+
+	SubscriptionBasicJobs      = int64(100)
+	SubscriptionProJobs        = int64(1_000)
+	SubscriptionEnterpriseJobs = int64(0) // 0 means unlimited
+
+	SubscriptionDurationSlots = EpochSlots * 30 // ~30 days
 )
 
 // Keccak256 computes keccak256 of the input data.
@@ -151,6 +162,56 @@ type ProtocolAttestation struct {
 	Signature      HexBytes `json:"signature"`
 }
 
+// ---------------------------------------------------------------------------
+// Account & Subscription types
+// ---------------------------------------------------------------------------
+
+// Account represents a user's on-chain balance.
+type Account struct {
+	Address string `json:"address"`
+	Balance int64  `json:"balance"` // uBIGT
+	Nonce   int64  `json:"nonce"`
+}
+
+// SubscriptionPlan identifies a tier.
+type SubscriptionPlan string
+
+const (
+	PlanBasic      SubscriptionPlan = "basic"
+	PlanPro        SubscriptionPlan = "pro"
+	PlanEnterprise SubscriptionPlan = "enterprise"
+)
+
+// Subscription tracks a user's active monthly subscription.
+type Subscription struct {
+	UserAddr    string           `json:"user_addr"`
+	Plan        SubscriptionPlan `json:"plan"`
+	StartSlot   int64            `json:"start_slot"`
+	ExpiresSlot int64            `json:"expires_slot"`
+	JobsUsed    int64            `json:"jobs_used"`
+	JobsLimit   int64            `json:"jobs_limit"` // 0 = unlimited
+	PaidAmount  int64            `json:"paid_amount"` // uBIGT charged
+	AutoRenew   bool             `json:"auto_renew"`
+}
+
+// DepositTx credits uBIGT to a user account (e.g. from L1 bridge or faucet).
+type DepositTx struct {
+	UserAddr string `json:"user_addr"`
+	Amount   int64  `json:"amount"`
+}
+
+// SubscribeTx creates or renews a monthly subscription.
+type SubscribeTx struct {
+	UserAddr  string           `json:"user_addr"`
+	Plan      SubscriptionPlan `json:"plan"`
+	AutoRenew bool             `json:"auto_renew"`
+}
+
+// CancelSubscriptionTx cancels auto-renewal of a subscription.
+type CancelSubscriptionTx struct {
+	UserAddr string `json:"user_addr"`
+}
+
 // JustificationTx is submitted by a validator to justify a mismatched commitment.
 type JustificationTx struct {
 	JobID         string `json:"job_id"`
@@ -181,6 +242,9 @@ const (
 	TxUnjail            TxType = "unjail"
 	TxProposeModel      TxType = "propose_model"
 	TxApproveModel      TxType = "approve_model"
+	TxDeposit           TxType = "deposit"
+	TxSubscribe         TxType = "subscribe"
+	TxCancelSubscription TxType = "cancel_subscription"
 )
 
 // Tx is the generic transaction envelope used in DeliverTx.

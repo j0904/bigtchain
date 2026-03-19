@@ -1,0 +1,147 @@
+# docker-compose.yml — 3-validator BIGT testnet
+version: "3.8"
+
+services:
+  # One-shot init container generates testnet config for all validators.
+  init:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -f /testnet/.initialized ]; then
+          echo "Testnet already initialized, skipping."
+          exit 0
+        fi
+        # Initialize 3 CometBFT validator nodes.
+        for i in 1 2 3; do
+          bigt --home /testnet/node$$i --init
+        done
+
+        # Collect validator public keys and build a shared genesis.
+        # Each node generated its own priv_validator_key.json during --init.
+        GENESIS_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        VALS="[]"
+        for i in 1 2 3; do
+          ADDR=$(cat /testnet/node$$i/config/priv_validator_key.json | jq -r '.address')
+          PUBKEY=$(cat /testnet/node$$i/config/priv_validator_key.json | jq -r '.pub_key.value')
+          VALS=$(echo "$$VALS" | jq --arg addr "$$ADDR" --arg pk "$$PUBKEY" --arg mon "validator-$$i" \
+            '. + [{"address": $$addr, "pub_key": $$pk, "bls_pub_key": "", "bond": 10000000000, "commission_bps": 500, "moniker": $$mon}]')
+        done
+
+        # Build CometBFT genesis doc that wraps our app genesis as app_state.
+        APP_STATE=$(jq -n \
+          --arg chain_id "bigt-docker-test" \
+          --arg time "$$GENESIS_TIME" \
+          --argjson supply 100000000000000 \
+          --argjson min_stake 5000000000 \
+          --argjson slot_sec 6 \
+          --argjson epoch 100 \
+          --argjson vals "$$VALS" \
+          '{chain_id: $$chain_id, genesis_time: $$time, total_supply_ubigt: $$supply, min_stake_ubigt: $$min_stake, slot_seconds: $$slot_sec, epoch_slots: $$epoch, validators: $$vals}')
+
+        # Build CometBFT validators array for the genesis doc.
+        CMT_VALS="[]"
+        for i in 1 2 3; do
+          ADDR=$(cat /testnet/node$$i/config/priv_validator_key.json | jq -r '.address')
+          PUBKEY=$(cat /testnet/node$$i/config/priv_validator_key.json | jq -r '.pub_key.value')
+          TYPE=$(cat /testnet/node$$i/config/priv_validator_key.json | jq -r '.pub_key.type')
+          CMT_VALS=$(echo "$$CMT_VALS" | jq --arg addr "$$ADDR" --arg pk "$$PUBKEY" --arg type "$$TYPE" \
+            '. + [{"address": $$addr, "pub_key": {"type": $$type, "value": $$pk}, "power": "10", "name": ""}]')
+        done
+
+        # Write shared CometBFT genesis.json to each node.
+        for i in 1 2 3; do
+          jq -n \
+            --arg time "$$GENESIS_TIME" \
+            --arg chain_id "bigt-docker-test" \
+            --argjson vals "$$CMT_VALS" \
+            --argjson app_state "$$APP_STATE" \
+            '{
+              genesis_time: $$time,
+              chain_id: $$chain_id,
+              initial_height: "1",
+              consensus_params: {
+                block: {max_bytes: "22020096", max_gas: "-1"},
+                evidence: {max_age_num_blocks: "100000", max_age_duration: "172800000000000", max_bytes: "1048576"},
+                validator: {pub_key_types: ["ed25519"]},
+                version: {app: "0"}
+              },
+              validators: $$vals,
+              app_hash: "",
+              app_state: $$app_state
+            }' > /testnet/node$$i/config/genesis.json
+        done
+
+        # Collect persistent peer addresses and write to shared file.
+        PEERS=""
+        for i in 1 2 3; do
+          NODE_ID=$(bigt --home /testnet/node$$i --show-node-id)
+          if [ -n "$$PEERS" ]; then PEERS="$$PEERS,"; fi
+          PEERS="$${PEERS}$${NODE_ID}@validator$$i:26656"
+        done
+        echo "$$PEERS" > /testnet/peers.txt
+
+        touch /testnet/.initialized
+        echo "=== Testnet initialized with 3 validators ==="
+        echo "Peers: $$PEERS"
+    volumes:
+      - testnet-data:/testnet
+
+  validator1:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    entrypoint: ["sh", "-c", "export BIGT_PERSISTENT_PEERS=$(cat /testnet/peers.txt) && exec bigt --home /testnet/node1"]
+    environment:
+      - BIGT_ALLOW_DUPLICATE_IP=true
+      - BIGT_ADDR_BOOK_STRICT=false
+    ports:
+      - "26657:26657"
+    volumes:
+      - testnet-data:/testnet
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:26657/status"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  validator2:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    entrypoint: ["sh", "-c", "export BIGT_PERSISTENT_PEERS=$(cat /testnet/peers.txt) && exec bigt --home /testnet/node2"]
+    environment:
+      - BIGT_ALLOW_DUPLICATE_IP=true
+      - BIGT_ADDR_BOOK_STRICT=false
+    ports:
+      - "26658:26657"
+    volumes:
+      - testnet-data:/testnet
+
+  validator3:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    entrypoint: ["sh", "-c", "export BIGT_PERSISTENT_PEERS=$(cat /testnet/peers.txt) && exec bigt --home /testnet/node3"]
+    environment:
+      - BIGT_ALLOW_DUPLICATE_IP=true
+      - BIGT_ADDR_BOOK_STRICT=false
+    ports:
+      - "26659:26657"
+    volumes:
+      - testnet-data:/testnet
+
+volumes:
+  testnet-data:

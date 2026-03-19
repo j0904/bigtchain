@@ -54,11 +54,26 @@ func Default() *Genesis {
 }
 
 // Load reads a genesis JSON from disk.
+// Supports both raw app genesis format and CometBFT genesis format
+// (where the app genesis is nested inside the "app_state" field).
 func Load(path string) (*Genesis, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+
+	// Try CometBFT genesis format first (has app_state field).
+	var wrapper struct {
+		AppState json.RawMessage `json:"app_state"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.AppState) > 0 {
+		var g Genesis
+		if err := json.Unmarshal(wrapper.AppState, &g); err == nil && g.ChainID != "" {
+			return &g, nil
+		}
+	}
+
+	// Fall back to raw app genesis format.
 	var g Genesis
 	if err := json.Unmarshal(data, &g); err != nil {
 		return nil, err

@@ -14,6 +14,7 @@ abcitypes "github.com/cometbft/cometbft/abci/types"
 "github.com/bigtchain/bigt/chain/modules/rewards"
 "github.com/bigtchain/bigt/chain/modules/slashing"
 "github.com/bigtchain/bigt/chain/modules/staking"
+"github.com/bigtchain/bigt/chain/modules/subscription"
 "github.com/bigtchain/bigt/chain/modules/vrf"
 "github.com/bigtchain/bigt/chain/registry"
 "github.com/bigtchain/bigt/chain/store"
@@ -30,6 +31,7 @@ jobs     *jobs.Module
 registry *registry.Registry
 rewards  *rewards.Module
 slashing *slashing.Handler
+subscription *subscription.Module
 
 currentSlot  int64
 currentEpoch int64
@@ -53,7 +55,8 @@ jm := jobs.New(s)
 reg := registry.New(s, 3)
 rm := rewards.New(s, st)
 sh := slashing.New(st, jm)
-return &App{store: s, staking: st, jobs: jm, registry: reg, rewards: rm, slashing: sh}, nil
+sub := subscription.New(s)
+return &App{store: s, staking: st, jobs: jm, registry: reg, rewards: rm, slashing: sh, subscription: sub}, nil
 }
 
 func (a *App) Info(_ context.Context, _ *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
@@ -186,6 +189,12 @@ case types.TxProposeModel:
 return a.handleProposeModel(tx)
 case types.TxApproveModel:
 return a.handleApproveModel(tx)
+case types.TxDeposit:
+return a.handleDeposit(tx)
+case types.TxSubscribe:
+return a.handleSubscribe(tx)
+case types.TxCancelSubscription:
+return a.handleCancelSubscription(tx)
 default:
 return errResult(2, "unknown tx type: "+string(tx.Type))
 }
@@ -202,6 +211,10 @@ return errResult(11, err.Error())
 }
 if !valid {
 return errResult(12, "model not registered: "+req.ModelID)
+}
+// Enforce active subscription with remaining quota.
+if err := a.subscription.ConsumeJob(req.UserAddr, a.currentSlot); err != nil {
+return errResult(14, "subscription check failed: "+err.Error())
 }
 if err := a.jobs.Commit(req, a.currentSlot, a.server); err != nil {
 return errResult(13, err.Error())
@@ -359,6 +372,39 @@ return errResult(101, err.Error())
 return okResult("model vote recorded: " + msg.ModelID)
 }
 
+func (a *App) handleDeposit(tx types.Tx) *abcitypes.ExecTxResult {
+var d types.DepositTx
+if err := json.Unmarshal(tx.Payload, &d); err != nil {
+return errResult(110, err.Error())
+}
+if err := a.subscription.Deposit(d); err != nil {
+return errResult(111, err.Error())
+}
+return okResult(fmt.Sprintf("deposited %d uBIGT to %s", d.Amount, d.UserAddr))
+}
+
+func (a *App) handleSubscribe(tx types.Tx) *abcitypes.ExecTxResult {
+var s types.SubscribeTx
+if err := json.Unmarshal(tx.Payload, &s); err != nil {
+return errResult(120, err.Error())
+}
+if err := a.subscription.Subscribe(s, a.currentSlot); err != nil {
+return errResult(121, err.Error())
+}
+return okResult(fmt.Sprintf("subscribed %s to plan %s", s.UserAddr, s.Plan))
+}
+
+func (a *App) handleCancelSubscription(tx types.Tx) *abcitypes.ExecTxResult {
+var c types.CancelSubscriptionTx
+if err := json.Unmarshal(tx.Payload, &c); err != nil {
+return errResult(130, err.Error())
+}
+if err := a.subscription.CancelAutoRenew(c.UserAddr); err != nil {
+return errResult(131, err.Error())
+}
+return okResult("subscription auto-renew cancelled for " + c.UserAddr)
+}
+
 func (a *App) Query(_ context.Context, req *abcitypes.RequestQuery) (*abcitypes.ResponseQuery, error) {
 switch req.Path {
 case "/validators":
@@ -374,6 +420,20 @@ if err != nil || j == nil {
 return &abcitypes.ResponseQuery{Code: 1, Log: "job not found"}, nil
 }
 data, _ := json.Marshal(j)
+return &abcitypes.ResponseQuery{Value: data}, nil
+case "/account":
+acct, err := a.subscription.GetAccount(string(req.Data))
+if err != nil || acct == nil {
+return &abcitypes.ResponseQuery{Code: 1, Log: "account not found"}, nil
+}
+data, _ := json.Marshal(acct)
+return &abcitypes.ResponseQuery{Value: data}, nil
+case "/subscription":
+sub, err := a.subscription.GetSubscription(string(req.Data))
+if err != nil || sub == nil {
+return &abcitypes.ResponseQuery{Code: 1, Log: "subscription not found"}, nil
+}
+data, _ := json.Marshal(sub)
 return &abcitypes.ResponseQuery{Value: data}, nil
 default:
 return &abcitypes.ResponseQuery{Code: 1, Log: "unknown path: " + req.Path}, nil
