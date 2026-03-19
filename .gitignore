@@ -1,0 +1,41 @@
+# ── Go ──────────────────────────────────────────────────────────────────────
+# Compiled binaries (match any executable at the repo root or in cmd/)
+/bigt
+/validator
+/relayer
+cmd/bigt/bigt
+cmd/validator/validator
+cmd/relayer/relayer
+
+# Test cache and coverage
+*.test
+*.out
+coverage.txt
+
+# Module download cache (should not be committed)
+vendor/
+
+# ── Foundry / Solidity ───────────────────────────────────────────────────────
+# Forge build artifacts
+contracts/out/
+contracts/cache/
+
+# Foundry broadcast logs (contain deployment tx hashes; commit deliberately if wanted)
+contracts/broadcast/
+
+# ── Node / frontend (if added later) ────────────────────────────────────────
+node_modules/
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Secrets / local config ───────────────────────────────────────────────────
+.env
+*.pem
+*.key
